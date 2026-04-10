@@ -1,0 +1,116 @@
+name: Build Wheels & Release (Linux only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Release? 1 = yes, 0 = no'
+        default: '0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build_wheels:
+    name: ${{ matrix.os }} P${{ matrix.pyver }} C${{ matrix.cuda }} R${{ matrix.rocm }} T${{ matrix.torch }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: pwsh
+    strategy:
+      matrix:
+        include:
+
+        # Ubuntu 22.04 CUDA - Python 3.11
+          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.7.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.8.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.9.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+          - { artname: 'wheel', os: ubuntu-22.04, pyver: '3.11', cuda: '12.8.1', rocm:    '', torch: '2.10.0', cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX' }
+
+      fail-fast: false
+
+    steps:
+      #Free disk space
+
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        if: runner.os == 'Linux'
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          swap-storage: true
+
+      # Setup Python
+
+      - uses: actions/checkout@v4
+
+      # Get version string from package
+
+      - name: Get version string
+        id: package_version
+        run: |
+          $versionString = Get-Content $(Join-Path 'exllamav3' 'version.py') -raw
+          if ($versionString -match '__version__ = "(\d+\.(?:\d+\.?(?:dev\d+)?)*)"')
+          {
+            Write-Output $('::notice file=build-wheels-release.yml,line=200,title=Package Version::Detected package version is: {0}' -f $Matches[1])
+            Write-Output "PACKAGE_VERSION=$($Matches[1])" >> "$env:GITHUB_OUTPUT"
+          }
+          else
+          {
+            Write-Output '::error file=build-wheels-release.yml,line=203::Could not parse version from exllamav2/version.py! You must upload wheels manually!'
+            Write-Output "PACKAGE_VERSION=None" >> "$env:GITHUB_OUTPUT"
+          }
+
+      # Install uv for easier python setup
+      - name: Install the latest version of uv and set the python version
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.pyver }}
+
+      - name: Install Linux CUDA ${{ matrix.cuda }}
+        uses: Jimver/cuda-toolkit@v0.2.24
+        id: cuda-toolkit-Linux
+        with:
+          cuda: "${{ matrix.cuda }}"
+          linux-local-args: '["--toolkit"]'
+          method: "network"
+        if: matrix.cuda != ''
+
+      - name: Install CUDA build Dependencies
+        if: matrix.cuda != ''
+        id: cuda_deps
+        run: |
+          git config --system core.longpaths true
+          $cudaVersion = '${{ matrix.cuda }}'
+          $cudaVersionPytorch = '${{ matrix.cuda }}'.Remove('${{ matrix.cuda }}'.LastIndexOf('.')).Replace('.','')
+          Write-Output "CUDA_VERSION_PYTORCH=$cudaVersionPytorch" >> "$env:GITHUB_OUTPUT"
+          $pytorchIndexUrl = "https://download.pytorch.org/whl/cu$cudaVersionPytorch"
+
+          uv pip install torch==${{ matrix.torch }} --index-url $pytorchIndexUrl
+          uv pip install --upgrade build setuptools==69.5.1 wheel packaging ninja safetensors tokenizers numpy
+
+      - name: Build for CUDA
+        if: matrix.cuda != ''
+        run: |
+          # --- Build wheel
+          $BUILDTAG = "+cu${{ steps.cuda_deps.outputs.CUDA_VERSION_PYTORCH }}-torch${{ matrix.torch }}"
+          $env:BUILD_TARGET = "cuda"
+          $env:TORCH_CUDA_ARCH_LIST = '${{ matrix.cudaarch }}'
+          python -m build -n --wheel -C--build-option=egg_info "-C--build-option=--tag-build=$BUILDTAG"
+
+      # Upload files
+
+      - name: Upload files to GitHub release
+        if: steps.package_version.outputs.PACKAGE_VERSION != 'None' && inputs.release == '1'
+        uses: svenstaro/upload-release-action@2.6.1
+        with:
+          file: ./dist/*.whl
+          tag: ${{ format('v{0}', steps.package_version.outputs.PACKAGE_VERSION) }}
+          file_glob: true
+          overwrite: true
+          release_name: ${{ steps.package_version.outputs.PACKAGE_VERSION }}
